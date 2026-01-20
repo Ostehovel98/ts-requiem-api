@@ -1,0 +1,18 @@
+[
+  {
+    "id": 1,
+    "driver__steamID64": "76561198000000000",
+    "name": "TestDriver",
+    "car": 1,
+    "track": 1,
+    "layout": 0,
+    "condition": 0,
+    "weather": 0,
+    "timing": 123.456,
+    "ghostLength": 999,
+    "ghostPath": null,
+    "sha256": null,
+    "size": null,
+    "createdAt": "2026-01-20T19:52:05.492Z"
+  }
+]
