@@ -36,6 +36,21 @@ function toFloat(v) {
 const zInt = z.preprocess((v) => toInt(v), z.number().int());
 const zFloat = z.preprocess((v) => toFloat(v), z.number());
 
+// Admin auth helper
+function requireAdmin(req, reply) {
+  const expected = process.env.ADMIN_KEY;
+  if (!expected) {
+    reply.code(500).send({ ok: false, error: "ADMIN_KEY not set on server" });
+    return true;
+  }
+  const got = String(req.headers["x-admin-key"] || "");
+  if (got !== expected) {
+    reply.code(401).send({ ok: false, error: "Unauthorized" });
+    return true;
+  }
+  return false;
+}
+
 const fastify = Fastify({
   logger: true,
   ignoreTrailingSlash: true
@@ -419,6 +434,72 @@ fastify.get("/getRecords", async (req) => {
   }));
 
   return { records: out };
+});
+
+// --------------------
+// ADMIN: wipe/delete records (requires header x-admin-key)
+// --------------------
+
+// Wipe ALL records
+fastify.post("/admin/wipe-all", async (req, reply) => {
+  if (requireAdmin(req, reply)) return;
+
+  const count = records.length;
+  records.splice(0, records.length); // clear in-place
+  saveRecords();
+
+  return { ok: true, deleted: count };
+});
+
+// Wipe by SteamID64
+fastify.post("/admin/wipe-steamid", async (req, reply) => {
+  if (requireAdmin(req, reply)) return;
+
+  const steamid = String(req.body?.steamid || "").trim();
+  if (!steamid) return reply.code(400).send({ ok: false, error: "Missing body.steamid" });
+
+  const before = records.length;
+  const kept = records.filter((r) => r.driver__steamID64 !== steamid);
+
+  records.splice(0, records.length, ...kept);
+  saveRecords();
+
+  return { ok: true, deleted: before - records.length, steamid };
+});
+
+// Wipe by Car ID
+fastify.post("/admin/wipe-car", async (req, reply) => {
+  if (requireAdmin(req, reply)) return;
+
+  const car = toInt(req.body?.car);
+  if (car == null) return reply.code(400).send({ ok: false, error: "Missing/invalid body.car" });
+
+  const before = records.length;
+  const kept = records.filter((r) => r.car !== car);
+
+  records.splice(0, records.length, ...kept);
+  saveRecords();
+
+  return { ok: true, deleted: before - records.length, car };
+});
+
+// Wipe by Track + Layout
+fastify.post("/admin/wipe-track-layout", async (req, reply) => {
+  if (requireAdmin(req, reply)) return;
+
+  const track = toInt(req.body?.track);
+  const layout = toInt(req.body?.layout);
+  if (track == null || layout == null) {
+    return reply.code(400).send({ ok: false, error: "Missing/invalid body.track or body.layout" });
+  }
+
+  const before = records.length;
+  const kept = records.filter((r) => !(r.track === track && r.layout === layout));
+
+  records.splice(0, records.length, ...kept);
+  saveRecords();
+
+  return { ok: true, deleted: before - records.length, track, layout };
 });
 
 // Make sure Render sees a bound listener
