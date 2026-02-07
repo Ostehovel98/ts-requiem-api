@@ -11,9 +11,33 @@ import { records, saveRecords } from "./store.js";
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Readable } from "node:stream";
 
+// --------------------
+// Helpers
+// --------------------
+function toInt(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return null;
+  return Math.trunc(n);
+}
+
+function toFloat(v) {
+  const s0 = String(v ?? "").trim();
+  if (!s0) return null;
+  // accept "114,535" as 114.535
+  const s = s0.replace(",", ".");
+  const n = Number(s);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+// Zod: accept numbers OR strings (including comma decimals)
+const zInt = z.preprocess((v) => toInt(v), z.number().int());
+const zFloat = z.preprocess((v) => toFloat(v), z.number());
+
 const fastify = Fastify({
   logger: true,
-  // Important: this makes `/getRecords/` work the same as `/getRecords`
   ignoreTrailingSlash: true
 });
 
@@ -75,16 +99,17 @@ fastify.get("/health", async () => ({
 // --------------------
 // /leaderboard (JSON)
 // --------------------
+// NOTE: timing can arrive as string; we coerce it safely.
 const leaderboardSchema = z.object({
   driver__steamID64: z.string(),
   name: z.string(),
-  car: z.number().int(),
-  track: z.number().int(),
-  layout: z.number().int(),
-  condition: z.number().int(),
-  weather: z.number().int(),
-  timing: z.number(),
-  ghostLength: z.number().int()
+  car: zInt,
+  track: zInt,
+  layout: zInt,
+  condition: zInt,
+  weather: zInt,
+  timing: zFloat,
+  ghostLength: zInt
 });
 
 fastify.post("/leaderboard", async (req, reply) => {
@@ -94,6 +119,11 @@ fastify.post("/leaderboard", async (req, reply) => {
   }
 
   const p = parsed.data;
+
+  // Extra safety: never store NaN/Infinity
+  if (!Number.isFinite(p.timing)) {
+    return reply.code(400).send({ ok: false, error: "Invalid timing" });
+  }
 
   const keyMatch = (r) =>
     r.driver__steamID64 === p.driver__steamID64 &&
@@ -119,7 +149,7 @@ fastify.post("/leaderboard", async (req, reply) => {
     return { ok: true, status: "created" };
   }
 
-  if (p.timing < existing.timing) {
+  if (!Number.isFinite(existing.timing) || p.timing < existing.timing) {
     existing.timing = p.timing;
     existing.ghostLength = p.ghostLength;
     existing.name = p.name;
@@ -183,13 +213,20 @@ fastify.post("/ghost", async (req, reply) => {
     return reply.code(400).send({ ok: false, error: "sha256 mismatch", computed, provided });
   }
 
-  const track = Number(fields.track);
-  const layout = Number(fields.layout);
-  const condition = Number(fields.condition);
-  const weather = Number(fields.weather);
-  const car = Number(fields.car);
-  const timing = Number(fields.timing);
-  const ghostLength = Number(fields.ghostLength);
+  const track = toInt(fields.track);
+  const layout = toInt(fields.layout);
+  const condition = toInt(fields.condition);
+  const weather = toInt(fields.weather);
+  const car = toInt(fields.car);
+  const timing = toFloat(fields.timing);
+  const ghostLength = toInt(fields.ghostLength);
+
+  if ([track, layout, condition, weather, car, ghostLength].some((x) => x == null) || timing == null) {
+    return reply.code(400).send({
+      ok: false,
+      error: "Invalid numeric field(s). Check track/layout/condition/weather/car/timing/ghostLength."
+    });
+  }
 
   // Always trust actual bytes length
   const size = ghostBuffer.length;
@@ -220,6 +257,7 @@ fastify.post("/ghost", async (req, reply) => {
     storedWhere = "local";
   }
 
+  // Attach to matching record for same driver+combo
   const rec = records.find(
     (r) =>
       r.driver__steamID64 === steamId &&
@@ -241,6 +279,7 @@ fastify.post("/ghost", async (req, reply) => {
     rec.ghostKey = storedWhere === "r2" ? objectKey : null;
     rec.ghostPath = storedWhere === "local" ? localPath : null;
   } else {
+    // If /leaderboard wasn’t called first, create it here
     records.push({
       id: nextId(),
       driver__steamID64: steamId,
@@ -276,11 +315,11 @@ fastify.post("/ghost", async (req, reply) => {
 // --------------------
 fastify.get("/ghost/bytes", async (req, reply) => {
   const q = req.query || {};
-  const track = Number(q.track ?? 0);
-  const layout = Number(q.layout ?? 0);
-  const condition = Number(q.condition ?? 0);
-  const weather = Number(q.weather ?? 0);
-  const car = Number(q.car ?? 0);
+  const track = toInt(q.track ?? 0);
+  const layout = toInt(q.layout ?? 0);
+  const condition = toInt(q.condition ?? 0);
+  const weather = toInt(q.weather ?? 0);
+  const car = toInt(q.car ?? 0);
   const steamid = q.steamid ? String(q.steamid) : null;
 
   let candidates = records.filter(
@@ -299,7 +338,7 @@ fastify.get("/ghost/bytes", async (req, reply) => {
     return reply.code(404).send("ghost not found");
   }
 
-  candidates.sort((a, b) => a.timing - b.timing);
+  candidates.sort((a, b) => (a.timing ?? Infinity) - (b.timing ?? Infinity));
   const best = candidates[0];
 
   reply.header("Content-Type", "application/octet-stream");
@@ -345,11 +384,11 @@ fastify.get("/ghost/bytes", async (req, reply) => {
 fastify.get("/getRecords", async (req) => {
   const q = req.query || {};
 
-  const track = Number(q.track ?? -1);
-  const layout = Number(q.layout ?? -1);
-  const condition = Number(q.condition ?? -1);
-  const weather = Number(q.weather ?? -1);
-  const car = Number(q.car ?? -1);
+  const track = toInt(q.track ?? -1) ?? -1;
+  const layout = toInt(q.layout ?? -1) ?? -1;
+  const condition = toInt(q.condition ?? -1) ?? -1;
+  const weather = toInt(q.weather ?? -1) ?? -1;
+  const car = toInt(q.car ?? -1) ?? -1;
 
   const match = (wanted, actual) => (wanted === -1 ? true : wanted === actual);
 
@@ -361,6 +400,9 @@ fastify.get("/getRecords", async (req) => {
       match(weather, r.weather) &&
       match(car, r.car)
   );
+
+  // Drop broken timings so the game doesn't get null
+  list = list.filter((r) => Number.isFinite(r.timing));
 
   list.sort((a, b) => a.timing - b.timing);
 
