@@ -7,6 +7,10 @@ import crypto from "node:crypto";
 import { z } from "zod";
 import { records, saveRecords } from "./store.js";
 
+// R2 (S3-compatible)
+import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { Readable } from "node:stream";
+
 const fastify = Fastify({
   logger: true,
   ignoreTrailingSlash: true
@@ -23,8 +27,32 @@ await fastify.register(multipart, {
 const PORT = Number(process.env.PORT || 3000);
 const HOST = "0.0.0.0";
 
-const GHOST_DIR = path.resolve("data/ghosts");
-fs.mkdirSync(GHOST_DIR, { recursive: true });
+// ---- Local fallback dir (only used if R2 is not configured)
+const LOCAL_GHOST_DIR = path.resolve("data/ghosts");
+fs.mkdirSync(LOCAL_GHOST_DIR, { recursive: true });
+
+// ---- R2 config
+const R2_ENDPOINT = process.env.R2_ENDPOINT || "";
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
+const R2_BUCKET = process.env.R2_BUCKET || "";
+const R2_REGION = process.env.R2_REGION || "auto";
+
+const R2_ENABLED =
+  !!R2_ENDPOINT && !!R2_ACCESS_KEY_ID && !!R2_SECRET_ACCESS_KEY && !!R2_BUCKET;
+
+const s3 = R2_ENABLED
+  ? new S3Client({
+      region: R2_REGION,
+      endpoint: R2_ENDPOINT,
+      credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY
+      },
+      // Cloudflare R2 generally works best with path-style
+      forcePathStyle: true
+    })
+  : null;
 
 // Stable numeric IDs until you move to Postgres
 function nextId() {
@@ -32,8 +60,13 @@ function nextId() {
   return max + 1;
 }
 
-fastify.get("/", async () => ({ ok: true, hint: "Try /health or /getRecords" }));
-fastify.get("/health", async () => ({ ok: true, name: "ts-requiem-api" }));
+fastify.get("/", async () => ({
+  ok: true,
+  hint: "Try /health or /getRecords",
+  r2Enabled: R2_ENABLED
+}));
+
+fastify.get("/health", async () => ({ ok: true, name: "ts-requiem-api", r2Enabled: R2_ENABLED }));
 
 // --------------------
 // /leaderboard (JSON)
@@ -73,7 +106,9 @@ fastify.post("/leaderboard", async (req, reply) => {
     records.push({
       id: nextId(),
       ...p,
-      ghostPath: null,
+      // storage pointers
+      ghostKey: null,   // R2 key e.g. "ghosts/<sha>.tsreplay"
+      ghostPath: null,  // local fallback path
       sha256: null,
       size: null,
       createdAt: new Date().toISOString()
@@ -96,6 +131,7 @@ fastify.post("/leaderboard", async (req, reply) => {
 
 // --------------------
 // /ghost (multipart)
+// Upload ghost bytes to R2 (preferred) or local disk (fallback)
 // --------------------
 fastify.post("/ghost", async (req, reply) => {
   const parts = req.parts();
@@ -154,16 +190,37 @@ fastify.post("/ghost", async (req, reply) => {
   const timing = Number(fields.timing);
   const ghostLength = Number(fields.ghostLength);
 
-  // IMPORTANT: don’t trust client size; compute real size
+  // Always trust actual bytes length
   const size = ghostBuffer.length;
-
-  // Save ghost file locally (MVP)
-  const filename = `${provided}.bin`;
-  const filePath = path.join(GHOST_DIR, filename);
-  fs.writeFileSync(filePath, ghostBuffer);
 
   const steamId = String(fields.driver__steamID64);
   const name = String(fields.name);
+
+  // Where we store it:
+  // Prefer .tsreplay extension (even if content is generic bytes)
+  const objectKey = `ghosts/${provided}.tsreplay`;
+
+  let storedWhere = "none";
+  let localPath = null;
+
+  // Store in R2 if configured
+  if (R2_ENABLED) {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: objectKey,
+        Body: ghostBuffer,
+        ContentType: "application/octet-stream"
+      })
+    );
+    storedWhere = "r2";
+  } else {
+    // Fallback local disk (not reliable on Render free tier)
+    const filename = `${provided}.tsreplay`;
+    localPath = path.join(LOCAL_GHOST_DIR, filename);
+    fs.writeFileSync(localPath, ghostBuffer);
+    storedWhere = "local";
+  }
 
   // Attach to matching record for same driver+combo
   const rec = records.find(
@@ -177,13 +234,15 @@ fastify.post("/ghost", async (req, reply) => {
   );
 
   if (rec) {
-    rec.ghostPath = filePath;
     rec.sha256 = provided;
     rec.size = size;
     rec.timing = timing;
     rec.ghostLength = ghostLength;
     rec.name = name;
     rec.createdAt = new Date().toISOString();
+
+    rec.ghostKey = storedWhere === "r2" ? objectKey : null;
+    rec.ghostPath = storedWhere === "local" ? localPath : null;
   } else {
     // If /leaderboard wasn’t called first, create it here
     records.push({
@@ -197,7 +256,8 @@ fastify.post("/ghost", async (req, reply) => {
       weather,
       timing,
       ghostLength,
-      ghostPath: filePath,
+      ghostKey: storedWhere === "r2" ? objectKey : null,
+      ghostPath: storedWhere === "local" ? localPath : null,
       sha256: provided,
       size,
       createdAt: new Date().toISOString()
@@ -205,11 +265,18 @@ fastify.post("/ghost", async (req, reply) => {
   }
 
   saveRecords();
-  return { ok: true, storedAs: filename, size };
+
+  return {
+    ok: true,
+    storedAs: storedWhere === "r2" ? objectKey : path.basename(localPath),
+    where: storedWhere,
+    size
+  };
 });
 
 // --------------------
 // /ghost/bytes (binary)
+// Streams from R2 (preferred) or local disk (fallback)
 // --------------------
 fastify.get("/ghost/bytes", async (req, reply) => {
   const q = req.query || {};
@@ -227,7 +294,7 @@ fastify.get("/ghost/bytes", async (req, reply) => {
       r.condition === condition &&
       r.weather === weather &&
       r.car === car &&
-      r.ghostPath
+      (r.ghostKey || r.ghostPath)
   );
 
   if (steamid) candidates = candidates.filter((r) => r.driver__steamID64 === steamid);
@@ -239,10 +306,46 @@ fastify.get("/ghost/bytes", async (req, reply) => {
   candidates.sort((a, b) => a.timing - b.timing);
   const best = candidates[0];
 
-  const buf = fs.readFileSync(best.ghostPath);
   reply.header("Content-Type", "application/octet-stream");
-  reply.header("Content-Length", String(buf.length));
-  return reply.send(buf);
+
+  // Prefer R2
+  if (best.ghostKey && R2_ENABLED) {
+    try {
+      const out = await s3.send(
+        new GetObjectCommand({
+          Bucket: R2_BUCKET,
+          Key: best.ghostKey
+        })
+      );
+
+      // out.Body is a stream (Readable)
+      const bodyStream = out.Body;
+
+      // Some runtimes return web streams, normalize:
+      const nodeStream =
+        bodyStream instanceof Readable
+          ? bodyStream
+          : Readable.fromWeb(bodyStream);
+
+      if (out.ContentLength != null) {
+        reply.header("Content-Length", String(out.ContentLength));
+      }
+
+      return reply.send(nodeStream);
+    } catch (e) {
+      req.log.error({ err: e }, "Failed to fetch ghost from R2");
+      return reply.code(500).send("failed to fetch ghost");
+    }
+  }
+
+  // Fallback local
+  if (best.ghostPath && fs.existsSync(best.ghostPath)) {
+    const buf = fs.readFileSync(best.ghostPath);
+    reply.header("Content-Length", String(buf.length));
+    return reply.send(buf);
+  }
+
+  return reply.code(404).send("ghost not found");
 });
 
 // --------------------
